@@ -469,6 +469,46 @@ describe("sync engine", () => {
     expect(plugin.store.data.states["222222222::reversed::back"]).toBeDefined();
   });
 
+  it("creates basic child records from combo card Cartesian products", async () => {
+    const vault = new MemoryVault();
+    const file = await vault.create(
+      "Notes/Combo.md",
+      "^sprout-444444444\nQX | q1 || q2 |\nAX | a1 || a2 |",
+    );
+    const plugin = makePlugin(vault);
+
+    await syncOneFile(plugin, file);
+
+    expect(plugin.store.data.cards["444444444"].type).toBe("combo");
+    expect(plugin.store.data.cards["444444444::combo::q1::a1"]).toMatchObject({ type: "basic", q: "q1", a: "a1", parentId: "444444444" });
+    expect(plugin.store.data.cards["444444444::combo::q1::a2"]).toMatchObject({ type: "basic", q: "q1", a: "a2", parentId: "444444444" });
+    expect(plugin.store.data.cards["444444444::combo::q2::a1"]).toMatchObject({ type: "basic", q: "q2", a: "a1", parentId: "444444444" });
+    expect(plugin.store.data.cards["444444444::combo::q2::a2"]).toMatchObject({ type: "basic", q: "q2", a: "a2", parentId: "444444444" });
+    expect(plugin.store.data.states["444444444::combo::q1::a1"]).toBeDefined();
+    expect(plugin.store.data.states["444444444::combo::q2::a2"]).toBeDefined();
+  });
+
+  it("prunes stale combo children when variants shrink", async () => {
+    const vault = new MemoryVault();
+    const file = await vault.create(
+      "Notes/Combo.md",
+      "^sprout-444444444\nQX | q1 || q2 |\nAX | a1 || a2 |",
+    );
+    const plugin = makePlugin(vault);
+    await syncOneFile(plugin, file);
+
+    vault.files.set(file.path, {
+      file,
+      content: "^sprout-444444444\nQX | q1 |\nAX | a1 || a2 |",
+    });
+    await syncOneFile(plugin, file);
+
+    expect(plugin.store.data.cards["444444444::combo::q1::a1"]).toBeDefined();
+    expect(plugin.store.data.cards["444444444::combo::q1::a2"]).toBeDefined();
+    expect(plugin.store.data.cards["444444444::combo::q2::a1"]).toBeUndefined();
+    expect(plugin.store.data.cards["444444444::combo::q2::a2"]).toBeUndefined();
+  });
+
   // ── syncOneFile: quarantine ─────────────────────────────────────────────
 
   it("quarantines cards with parse errors", async () => {
@@ -616,6 +656,48 @@ describe("sync engine", () => {
     expect(res.newCount).toBe(2);
     expect(contentTwo).toContain("^learnkit-280000000");
     expect(Object.keys(plugin.store.data.cards)).toHaveLength(2);
+  });
+
+  it("creates combo child records during full question bank sync", async () => {
+    const vault = new MemoryVault();
+    await vault.create(
+      "Notes/Combo.md",
+      "^learnkit-780357773\nQX | What is the capital of France? || What is the name of the capital of France? |\nAX | Paris || 巴黎 |",
+    );
+    const plugin = makePlugin(vault);
+
+    const res = await syncQuestionBank(plugin);
+
+    expect(res.newCount).toBe(1);
+    expect(plugin.store.data.cards["780357773"]).toMatchObject({
+      type: "combo",
+      qVariants: ["What is the capital of France?", "What is the name of the capital of France?"],
+      aVariants: ["Paris", "巴黎"],
+    });
+    expect(plugin.store.data.cards["780357773::combo::q1::a1"]).toMatchObject({
+      type: "basic",
+      q: "What is the capital of France?",
+      a: "Paris",
+      parentId: "780357773",
+    });
+    expect(plugin.store.data.cards["780357773::combo::q1::a2"]).toMatchObject({
+      type: "basic",
+      q: "What is the capital of France?",
+      a: "巴黎",
+      parentId: "780357773",
+    });
+    expect(plugin.store.data.cards["780357773::combo::q2::a1"]).toMatchObject({
+      type: "basic",
+      q: "What is the name of the capital of France?",
+      a: "Paris",
+      parentId: "780357773",
+    });
+    expect(plugin.store.data.cards["780357773::combo::q2::a2"]).toMatchObject({
+      type: "basic",
+      q: "What is the name of the capital of France?",
+      a: "巴黎",
+      parentId: "780357773",
+    });
   });
 
   it("skips files with no cards and no orphan anchors", async () => {

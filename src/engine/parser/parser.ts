@@ -25,7 +25,7 @@ import { normalizeGroups } from "../indexing/group-format";
 
 const ANCHOR_RE = CARD_ANCHOR_LINE_RE;
 
-type CardType = "basic" | "reversed" | "mcq" | "cloze" | "io" | "hq" | "oq";
+type CardType = "basic" | "reversed" | "mcq" | "cloze" | "io" | "hq" | "oq" | "combo";
 
 export type McqOption = { text: string; isCorrect: boolean };
 
@@ -38,6 +38,8 @@ export type ParsedCard = {
   // basic
   q: string | null;
   a: string | null; // (also used for MCQ explanation)
+  qVariants: string[] | null;
+  aVariants: string[] | null;
 
   // mcq
   stem: string | null;
@@ -165,6 +167,13 @@ function validateClozeText(text: string): string[] {
   return validateClozeTextCompat(text);
 }
 
+function splitComboVariants(raw: string | null): string[] {
+  const text = String(raw ?? "").trim();
+  if (!text) return [];
+  const parts = text.includes("||") ? text.split(/\s*\|\|\s*/g) : text.split(/\r?\n/g);
+  return parts.map((part) => part.trim()).filter(Boolean);
+}
+
 /**
  * Auto-number bare `{{text}}` tokens into `{{c1::text}}`, `{{c2::text}}`, etc.
  * Already-numbered `{{cN::text}}` tokens are left untouched.
@@ -183,11 +192,13 @@ function makeEmptyCard(
   startLine: number,
   pendingId: string | null,
   pendingTitle: string | null,
-  kind: "Q" | "RQ" | "MCQ" | "CQ" | "IO" | "HQ" | "OQ",
+  kind: "Q" | "RQ" | "QX" | "MCQ" | "CQ" | "IO" | "HQ" | "OQ",
 ): ParsedCard {
   const type: CardType =
     kind === "Q"
       ? "basic"
+      : kind === "QX"
+        ? "combo"
       : kind === "RQ"
         ? "reversed"
         : kind === "MCQ"
@@ -207,6 +218,8 @@ function makeEmptyCard(
 
     q: null,
     a: null,
+    qVariants: null,
+    aVariants: null,
 
     stem: null,
     options: null,
@@ -357,6 +370,11 @@ export function parseCardsFromText(
       if (current.clozeText) {
         validateClozeText(current.clozeText).forEach((e) => current!.errors.push(e));
       }
+    } else if (current.type === "combo") {
+      current.qVariants = splitComboVariants(current.q);
+      current.aVariants = splitComboVariants(current.a);
+      if (current.qVariants.length < 1) current.errors.push("Combo card requires at least one QX question.");
+      if (current.aVariants.length < 1) current.errors.push("Combo card requires at least one AX answer.");
     } else if (current.type === "io") {
       const src = String(current.ioSrc ?? "").trim();
       if (!src) {
@@ -544,7 +562,7 @@ export function parseCardsFromText(
     if (sp) {
       flush();
 
-      const kind = sp[1] as "Q" | "RQ" | "MCQ" | "CQ" | "IO" | "HQ" | "OQ";
+      const kind = sp[1] as "Q" | "RQ" | "QX" | "MCQ" | "CQ" | "IO" | "HQ" | "OQ";
       const startLine = pendingIdLine !== null ? pendingIdLine : i;
 
       current = makeEmptyCard(notePath, startLine, pendingId, pendingTitle, kind);
@@ -559,7 +577,7 @@ export function parseCardsFromText(
       const { text: rawText, closed } = stripClosingPipe(restRaw);
       const first = unescapePipeText(rawText);
 
-      if (kind === "Q" || kind === "RQ") current.q = "";
+      if (kind === "Q" || kind === "RQ" || kind === "QX") current.q = "";
       if (kind === "MCQ") current.stem = "";
       if (kind === "CQ") current.clozeText = "";
       if (kind === "IO") current.ioSrc = "";
@@ -567,7 +585,7 @@ export function parseCardsFromText(
       if (kind === "OQ") { current.q = ""; current.oqSteps = []; }
 
       const key: CurrentFieldKey =
-        kind === "Q" || kind === "RQ" || kind === "OQ"
+        kind === "Q" || kind === "RQ" || kind === "QX" || kind === "OQ"
           ? "q"
           : kind === "MCQ"
             ? "stem"
@@ -765,6 +783,16 @@ export function parseCardsFromText(
 
       if (key === "A") {
         if (current.type !== "mcq") {
+          current.a = null;
+          appendToField(current, "a", chunk);
+          pipeField = closed ? null : "a";
+          currentField = null;
+          continue;
+        }
+      }
+
+      if (key === "AX") {
+        if (current.type === "combo") {
           current.a = null;
           appendToField(current, "a", chunk);
           pipeField = closed ? null : "a";

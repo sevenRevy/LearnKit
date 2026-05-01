@@ -287,6 +287,7 @@ export function buildSession(plugin: LearnKitPlugin, scope: Scope, options?: Ses
 /** Returns true for child card types that have siblings. */
 function isChildCard(card: CardRecord): boolean {
   const t = String(card?.type ?? "").toLowerCase();
+  if (String(card?.id ?? "").includes("::combo::") && card.parentId) return true;
   return t === "cloze-child" || t === "io-child" || t === "hq-child" || t === "reversed-child";
 }
 

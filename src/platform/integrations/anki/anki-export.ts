@@ -95,6 +95,8 @@ export async function exportToApkg(
     if (c.type === "cloze-child") return false;
     // Exclude reversed children — the parent reversed card is the export unit
     if (c.type === "reversed-child") return false;
+    // Exclude combo parents; generated basic children are the export units.
+    if (c.type === "combo") return false;
     return true;
   });
 

@@ -126,6 +126,34 @@ G | A/B, A::C |`
   });
 });
 
+describe("combo cards (QX/AX)", () => {
+  it("parses compact combo variants split by double pipes", () => {
+    const card = parseOne(
+      `QX | q1 || q2 |
+AX | a1 || a2 |`
+    );
+
+    expect(card.type).toBe("combo");
+    expect(card.qVariants).toEqual(["q1", "q2"]);
+    expect(card.aVariants).toEqual(["a1", "a2"]);
+    expect(card.errors).toHaveLength(0);
+  });
+
+  it("parses multiline combo variants one per line", () => {
+    const card = parseOne(
+      `QX | q1
+q2 |
+AX | a1
+a2 |`
+    );
+
+    expect(card.type).toBe("combo");
+    expect(card.qVariants).toEqual(["q1", "q2"]);
+    expect(card.aVariants).toEqual(["a1", "a2"]);
+    expect(card.errors).toHaveLength(0);
+  });
+});
+
 // ── MCQ cards ───────────────────────────────────────────────────────────────
 
 describe("MCQ cards", () => {

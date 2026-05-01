@@ -327,6 +327,9 @@ function cardSignature(rec: CardRecord | null): string {
   if (rec.type === "basic" || rec.type === "reversed") {
     base.q = rec.q || "";
     base.a = rec.a || "";
+  } else if (rec.type === "combo") {
+    base.qVariants = Array.isArray(rec.qVariants) ? rec.qVariants : [];
+    base.aVariants = Array.isArray(rec.aVariants) ? rec.aVariants : [];
   } else if (rec.type === "mcq") {
     base.stem = rec.stem || "";
     base.options = normalizeCardOptions(rec.options);
@@ -768,13 +771,27 @@ function deleteIoChildren(plugin: LearnKitPlugin, parentId: string): number { re
 function deleteHqChildren(plugin: LearnKitPlugin, parentId: string): number { return deleteChildrenByType(plugin, parentId, "hq-child"); }
 function deleteClozeChildren(plugin: LearnKitPlugin, parentId: string): number { return deleteChildrenByType(plugin, parentId, "cloze-child"); }
 function deleteReversedChildren(plugin: LearnKitPlugin, parentId: string): number { return deleteChildrenByType(plugin, parentId, "reversed-child"); }
+function deleteComboChildren(plugin: LearnKitPlugin, parentId: string): number {
+  const prefix = `${parentId}::combo::`;
+  let removed = 0;
+  for (const id of Object.keys(plugin.store.data.cards || {})) {
+    const rec = plugin.store.data.cards[id];
+    if (!rec) continue;
+    if (String(rec.parentId || "") !== parentId && !String(id).startsWith(prefix)) continue;
+    if (!String(id).startsWith(prefix)) continue;
+    delete plugin.store.data.cards[id];
+    if (plugin.store.data.states) delete (plugin.store.data.states)[id];
+    removed += 1;
+  }
+  return removed;
+}
 function deleteOrphanIoChildren(plugin: LearnKitPlugin): number { return deleteOrphanChildren(plugin, "io", "io-child"); }
 function deleteOrphanHqChildren(plugin: LearnKitPlugin): number { return deleteOrphanChildren(plugin, "hq", "hq-child"); }
 function deleteOrphanClozeChildren(plugin: LearnKitPlugin): number { return deleteOrphanChildren(plugin, "cloze", "cloze-child"); }
 function deleteOrphanReversedChildren(plugin: LearnKitPlugin): number { return deleteOrphanChildren(plugin, "reversed", "reversed-child"); }
 
 function countsAsStudyCardDeletion(cardType: string): boolean {
-  return cardType !== "cloze" && cardType !== "io" && cardType !== "hq" && cardType !== "reversed";
+  return cardType !== "cloze" && cardType !== "io" && cardType !== "hq" && cardType !== "reversed" && cardType !== "combo";
 }
 
 // ────────────────────────────────────────────
@@ -794,6 +811,52 @@ function stableClozeChildId(parentId: string, idx: number): string {
 /** Stable deterministic ID for a reversed child: `${parentId}::reversed::${dir}`. */
 function stableReversedChildId(parentId: string, dir: "forward" | "back"): string {
   return `${parentId}::reversed::${dir}`;
+}
+
+function stableComboChildId(parentId: string, qIndex: number, aIndex: number): string {
+  return `${parentId}::combo::q${qIndex + 1}::a${aIndex + 1}`;
+}
+
+function syncComboChildren(plugin: LearnKitPlugin, parent: CardRecord, now: number, schedulingSnapshot?: StateMap | null) {
+  const parentId = String(parent?.id ?? "");
+  if (!parentId) return;
+
+  const questions = Array.isArray(parent.qVariants) ? parent.qVariants : [];
+  const answers = Array.isArray(parent.aVariants) ? parent.aVariants : [];
+  const keepChildIds = new Set<string>();
+  const titleBase = String(parent?.title ?? "").trim();
+
+  for (let qi = 0; qi < questions.length; qi += 1) {
+    for (let ai = 0; ai < answers.length; ai += 1) {
+      const childId = stableComboChildId(parentId, qi, ai);
+      keepChildIds.add(childId);
+      const prev = plugin.store.data.cards?.[childId];
+      const childTitle = titleBase ? `${titleBase} - Q${qi + 1}/A${ai + 1}` : null;
+      const rec: CardRecord = {
+        id: childId,
+        type: "basic",
+        title: childTitle,
+        parentId,
+        q: questions[qi] ?? null,
+        a: answers[ai] ?? null,
+        info: parent?.info ?? null,
+        groups: parent?.groups ?? null,
+        sourceNotePath: String(parent?.sourceNotePath || ""),
+        sourceStartLine: Number(parent?.sourceStartLine ?? 0) || 0,
+        createdAt: resolveChildCreatedAt(prev, parent, now),
+        updatedAt: now,
+        lastSeenAt: now,
+      };
+      upsertChildRecord(plugin, childId, rec, now, schedulingSnapshot);
+    }
+  }
+
+  const prefix = `${parentId}::combo::`;
+  const existingChildren = Object.keys(plugin.store.data.cards || {})
+    .filter((id) => String(id).startsWith(prefix))
+    .map((id) => plugin.store.data.cards[id])
+    .filter((rec): rec is CardRecord => !!rec);
+  pruneStaleChildren(plugin, existingChildren, keepChildIds);
 }
 
 /**
@@ -1592,8 +1655,10 @@ export async function syncOneFile(
 
         title: c.title ?? null,
 
-        q: (c.type === "basic" || c.type === "reversed" || c.type === "oq") ? (c.q ?? null) : null,
-        a: (c.type === "basic" || c.type === "reversed") ? (c.a ?? null) : c.type === "mcq" ? (c.a ?? null) : null,
+        q: (c.type === "basic" || c.type === "reversed" || c.type === "oq" || c.type === "combo") ? (c.q ?? null) : null,
+        a: (c.type === "basic" || c.type === "reversed" || c.type === "combo") ? (c.a ?? null) : c.type === "mcq" ? (c.a ?? null) : null,
+        qVariants: c.type === "combo" ? (c.qVariants ?? []) : null,
+        aVariants: c.type === "combo" ? (c.aVariants ?? []) : null,
 
         stem: c.type === "mcq" ? (c.stem ?? null) : null,
         ...(c.type === "mcq"
@@ -1664,6 +1729,7 @@ export async function syncOneFile(
 
       if (c.type === "cloze") syncClozeChildren(plugin, record, now, schedulingSnapshot);
       if (c.type === "reversed") syncReversedChildren(plugin, record, now, schedulingSnapshot);
+      if (c.type === "combo") syncComboChildren(plugin, record, now, schedulingSnapshot);
 
       // IO: verify image exists, else quarantine; sync children if image present
       if (c.type === "io") {
@@ -1727,6 +1793,7 @@ export async function syncOneFile(
     const removedHqParentIds: string[] = [];
     const removedClozeParents: string[] = [];
     const removedReversedParents: string[] = [];
+    const removedComboParents: string[] = [];
 
     for (const id of Object.keys(plugin.store.data.cards || {})) {
       const rec = plugin.store.data.cards[id];
@@ -1740,6 +1807,7 @@ export async function syncOneFile(
         if (cardType === "hq") removedHqParentIds.push(String(id));
         if (cardType === "cloze") removedClozeParents.push(String(id));
         if (cardType === "reversed") removedReversedParents.push(String(id));
+        if (cardType === "combo") removedComboParents.push(String(id));
 
         delete plugin.store.data.cards[id];
         if (plugin.store.data.states) delete (plugin.store.data.states)[id];
@@ -1772,6 +1840,11 @@ export async function syncOneFile(
     }
     for (const parentId of removedReversedParents) {
       const childRemoved = deleteReversedChildren(plugin, parentId);
+      removed += childRemoved;
+      deletedDisplayCount += childRemoved;
+    }
+    for (const parentId of removedComboParents) {
+      const childRemoved = deleteComboChildren(plugin, parentId);
       removed += childRemoved;
       deletedDisplayCount += childRemoved;
     }
@@ -2049,8 +2122,10 @@ export async function syncQuestionBank(plugin: LearnKitPlugin) {
 
         title: c.title ?? null,
 
-        q: (c.type === "basic" || c.type === "reversed" || c.type === "oq") ? (c.q ?? null) : null,
-        a: (c.type === "basic" || c.type === "reversed") ? (c.a ?? null) : c.type === "mcq" ? (c.a ?? null) : null,
+        q: (c.type === "basic" || c.type === "reversed" || c.type === "oq" || c.type === "combo") ? (c.q ?? null) : null,
+        a: (c.type === "basic" || c.type === "reversed" || c.type === "combo") ? (c.a ?? null) : c.type === "mcq" ? (c.a ?? null) : null,
+        qVariants: c.type === "combo" ? (c.qVariants ?? []) : null,
+        aVariants: c.type === "combo" ? (c.aVariants ?? []) : null,
 
         stem: c.type === "mcq" ? (c.stem ?? null) : null,
         ...(c.type === "mcq"
@@ -2120,6 +2195,7 @@ export async function syncQuestionBank(plugin: LearnKitPlugin) {
 
       if (c.type === "cloze") syncClozeChildren(plugin, record, now, schedulingSnapshot);
       if (c.type === "reversed") syncReversedChildren(plugin, record, now, schedulingSnapshot);
+      if (c.type === "combo") syncComboChildren(plugin, record, now, schedulingSnapshot);
 
       if (c.type === "io") {
         let ioQuarantined = false;
@@ -2179,6 +2255,7 @@ export async function syncQuestionBank(plugin: LearnKitPlugin) {
     const removedHqParentIds: string[] = [];
     const removedClozeParents: string[] = [];
     const removedReversedParents: string[] = [];
+    const removedComboParents: string[] = [];
 
     for (const id of Object.keys(plugin.store.data.cards || {})) {
       const card = plugin.store.data.cards[id];
@@ -2192,6 +2269,7 @@ export async function syncQuestionBank(plugin: LearnKitPlugin) {
         if (cardType === "hq") removedHqParentIds.push(String(id));
         if (cardType === "cloze") removedClozeParents.push(String(id));
         if (cardType === "reversed") removedReversedParents.push(String(id));
+        if (cardType === "combo") removedComboParents.push(String(id));
 
         delete plugin.store.data.cards[id];
         if (plugin.store.data.states) delete (plugin.store.data.states)[id];
@@ -2224,6 +2302,11 @@ export async function syncQuestionBank(plugin: LearnKitPlugin) {
     }
     for (const parentId of removedReversedParents) {
       const childRemoved = deleteReversedChildren(plugin, parentId);
+      removed += childRemoved;
+      deletedDisplayCount += childRemoved;
+    }
+    for (const parentId of removedComboParents) {
+      const childRemoved = deleteComboChildren(plugin, parentId);
       removed += childRemoved;
       deletedDisplayCount += childRemoved;
     }

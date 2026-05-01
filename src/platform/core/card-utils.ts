@@ -74,6 +74,6 @@ export function isClozeParentCard(card: CardRecord): boolean {
  */
 export function isParentCard(card: CardRecord): boolean {
   const t = String(card?.type ?? "").toLowerCase();
-  if (t === "cloze" || t === "reversed") return true;
+  if (t === "cloze" || t === "reversed" || t === "combo") return true;
   return isIoParentCard(card) || isHqParentCard(card) || isClozeParentCard(card);
 }
