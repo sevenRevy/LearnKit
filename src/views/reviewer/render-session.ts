@@ -811,7 +811,7 @@ function renderMcqContent(ctx: CardRenderCtx): void {
     textEl.className = "min-w-0 whitespace-pre-wrap break-words learnkit-mcq-option-text";
 
     // Use markdown rendering if text contains wiki links or LaTeX
-    if (text && (text.includes('[[') || text.includes('![')  || text.includes('$') || text.includes('\\(') || text.includes('\\['))) {
+    if (text && (text.includes('[[') || text.includes('<!--') ||text.includes('![') || text.includes('$') || text.includes('\\(') || text.includes('\\['))) {
       void args.renderMarkdownInto(textEl, forceSingleLineDisplayMathInline(text), sourcePath).then(() => setupLinkHandlers(textEl, sourcePath));
     } else if (text && text.includes("\n")) {
       text.split(/\n+/).forEach((line: string) => {
