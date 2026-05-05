@@ -19,10 +19,13 @@ import {
   FLASHCARD_HEADER_FIELD_RE,
   BASIC_SHORTHAND_RE,
   CLOZE_SHORTHAND_RE,
+  COMBO_VARIANT_SEPARATOR,
   getDelimiter,
   escapeDelimiterText,
   formatDelimitedField,
   stripClosingDelimiter,
+  splitComboVariants,
+  splitZipVariants,
 } from "../../../platform/core/delimiter";
 import type { CardState } from "../../types/scheduler";
 import { loadSchedulingFromDataJson } from "../../../platform/core/store";
@@ -78,6 +81,15 @@ type TextEdit = {
   lineIndex: number;
   deleteLine?: boolean;
   insertText?: string;
+};
+
+type SyncMutationAction = "added" | "updated" | "deleted";
+
+type SyncMutationEvent = {
+  id: string;
+  type: string;
+  notePath: string;
+  reason?: string;
 };
 
 // ────────────────────────────────────────────
@@ -327,6 +339,14 @@ function cardSignature(rec: CardRecord | null): string {
   if (rec.type === "basic" || rec.type === "reversed") {
     base.q = rec.q || "";
     base.a = rec.a || "";
+    if (rec.extensionData && typeof rec.extensionData === "object") {
+      const ext = rec.extensionData;
+      const qv = ext.qVariants;
+      const av = ext.aVariants;
+      if ((Array.isArray(qv) && qv.length > 1) || (Array.isArray(av) && av.length > 1)) {
+        base.extensionData = rec.extensionData;
+      }
+    }
   } else if (rec.type === "mcq") {
     base.stem = rec.stem || "";
     base.options = normalizeCardOptions(rec.options);
@@ -374,6 +394,8 @@ function cardSignature(rec: CardRecord | null): string {
   } else if (rec.type === "oq") {
     base.q = rec.q || "";
     base.oqSteps = Array.isArray(rec.oqSteps) ? rec.oqSteps : [];
+  } else if (rec.type === "combo") {
+    base.extensionData = rec.extensionData ?? null;
   }
 
   return JSON.stringify(base);
@@ -607,6 +629,32 @@ function queueStripHiddenFields(lines: string[], edits: TextEdit[], card: Parsed
   }
 }
 
+/**
+ * Migrates legacy QX/AX combo fields to Q/A during sync.
+ * QX | ... | → Q | ... | and AX | ... | → A | ... |
+ * Only rewrites lines that match QX or AX field headers.
+ */
+function queueComboTypeMigration(lines: string[], edits: TextEdit[], card: ParsedCard): void {
+  const endLine = findAnchoredCardSearchEndLine(lines, card.sourceStartLine);
+
+  for (const [legacyKey, newKey] of [["QX", "Q"], ["AX", "A"]] as const) {
+    const fieldRange = findDelimitedFieldRange(lines, card.sourceStartLine, endLine, legacyKey);
+    if (!fieldRange) continue;
+
+    for (let lineIndex = fieldRange.start; lineIndex <= fieldRange.end; lineIndex++) {
+      const line = lines[lineIndex] || "";
+      const { prefix, rest } = splitMdPrefix(line);
+      const headerMatch = rest.match(FLASHCARD_HEADER_FIELD_RE());
+      if (!headerMatch || headerMatch[1]?.toUpperCase() !== legacyKey) continue;
+
+      // Replace the field key (QX → Q, AX → A) and convert legacy || to :: in the value.
+      let newRest = rest.replace(/^(QX|AX)\b/, newKey);
+      newRest = newRest.replace(/\s*\|\|\s*/g, COMBO_VARIANT_SEPARATOR);
+      edits.push({ lineIndex, insertText: `${prefix}${newRest}`, deleteLine: true });
+    }
+  }
+}
+
 // ────────────────────────────────────────────
 // IO cleanup helpers
 // ────────────────────────────────────────────
@@ -768,13 +816,83 @@ function deleteIoChildren(plugin: LearnKitPlugin, parentId: string): number { re
 function deleteHqChildren(plugin: LearnKitPlugin, parentId: string): number { return deleteChildrenByType(plugin, parentId, "hq-child"); }
 function deleteClozeChildren(plugin: LearnKitPlugin, parentId: string): number { return deleteChildrenByType(plugin, parentId, "cloze-child"); }
 function deleteReversedChildren(plugin: LearnKitPlugin, parentId: string): number { return deleteChildrenByType(plugin, parentId, "reversed-child"); }
+function deleteComboChildren(plugin: LearnKitPlugin, parentId: string): number { return deleteChildrenByType(plugin, parentId, "combo-child"); }
 function deleteOrphanIoChildren(plugin: LearnKitPlugin): number { return deleteOrphanChildren(plugin, "io", "io-child"); }
 function deleteOrphanHqChildren(plugin: LearnKitPlugin): number { return deleteOrphanChildren(plugin, "hq", "hq-child"); }
 function deleteOrphanClozeChildren(plugin: LearnKitPlugin): number { return deleteOrphanChildren(plugin, "cloze", "cloze-child"); }
 function deleteOrphanReversedChildren(plugin: LearnKitPlugin): number { return deleteOrphanChildren(plugin, "reversed", "reversed-child"); }
+function deleteOrphanComboChildren(plugin: LearnKitPlugin): number {
+  // Collect live combo parents: both legacy "combo" type and basic cards with extensionData
+  // containing variants, plus fallback to raw Q/A :: inspection.
+  const liveParents = new Set<string>();
+  for (const [id, rec] of Object.entries(plugin.store.data.cards || {})) {
+    if (!rec) continue;
+    if (String(rec.type) === "combo") { liveParents.add(String(rec.id ?? id)); continue; }
+    if (String(rec.type) !== "basic") continue;
+    const ext = rec.extensionData;
+    if (ext && typeof ext === "object" && !Array.isArray(ext)) {
+      const ed = ext;
+      const qv = ed.qVariants;
+      const av = ed.aVariants;
+      if ((Array.isArray(qv) && qv.length > 1) || (Array.isArray(av) && av.length > 1)) {
+        liveParents.add(String(rec.id ?? id));
+        continue;
+      }
+    }
+    // Fallback: check raw Q/A for ::
+    if (splitComboVariants(String(rec.q ?? "")).length > 1 || splitComboVariants(String(rec.a ?? "")).length > 1) {
+      liveParents.add(String(rec.id ?? id));
+    }
+  }
+
+  let removed = 0;
+  for (const id of Object.keys(plugin.store.data.cards || {})) {
+    const rec = plugin.store.data.cards[id];
+    if (!rec) continue;
+    if (String(rec.type) !== "combo-child") continue;
+    const pid = String(rec.parentId || "");
+    if (!pid || !liveParents.has(pid)) {
+      delete plugin.store.data.cards[id];
+      if (plugin.store.data.states) delete (plugin.store.data.states)[id];
+      removed += 1;
+    }
+  }
+
+  return removed;
+}
 
 function countsAsStudyCardDeletion(cardType: string): boolean {
   return cardType !== "cloze" && cardType !== "io" && cardType !== "hq" && cardType !== "reversed";
+}
+
+function logSyncMutation(
+  scope: "syncOneFile" | "syncQuestionBank",
+  action: SyncMutationAction,
+  event: SyncMutationEvent,
+): void {
+  log.debug(`${scope}: card ${action}`, {
+    id: event.id,
+    type: event.type,
+    notePath: event.notePath,
+    reason: event.reason,
+  });
+}
+
+function logSyncMutationSummary(
+  scope: "syncOneFile" | "syncQuestionBank",
+  events: { added: SyncMutationEvent[]; updated: SyncMutationEvent[]; deleted: SyncMutationEvent[] },
+): void {
+  if (!events.added.length && !events.updated.length && !events.deleted.length) return;
+
+  const format = (items: SyncMutationEvent[]) => items.map((item) => `${item.id} (${item.type})`).join(", ");
+  log.info(`${scope}: card mutations`, {
+    addedCount: events.added.length,
+    updatedCount: events.updated.length,
+    deletedCount: events.deleted.length,
+    added: format(events.added),
+    updated: format(events.updated),
+    deleted: format(events.deleted),
+  });
 }
 
 // ────────────────────────────────────────────
@@ -854,6 +972,138 @@ function syncReversedChildren(plugin: LearnKitPlugin, parent: CardRecord, now: n
   pruneStaleChildren(plugin, existingChildren, keepChildIds);
 }
 
+const NUMBER_WORDS: string[] = [
+  "Zero",
+  "One",
+  "Two",
+  "Three",
+  "Four",
+  "Five",
+  "Six",
+  "Seven",
+  "Eight",
+  "Nine",
+  "Ten",
+  "Eleven",
+  "Twelve",
+  "Thirteen",
+  "Fourteen",
+  "Fifteen",
+  "Sixteen",
+  "Seventeen",
+  "Eighteen",
+  "Nineteen",
+  "Twenty",
+];
+
+/** Convert a positive integer to its English word. Falls back to the number string for values > 20. */
+function toNumberWord(n: number): string {
+  const safe = Number.isFinite(n) && n > 0 ? Math.floor(n) : 1;
+  return NUMBER_WORDS[safe] ?? String(safe);
+}
+
+/** Stable deterministic ID for a combo child: `${parentId}::combo::q${qi+1}::a${ai+1}` (1-based). */
+function stableComboChildId(parentId: string, qi: number, ai: number): string {
+  return `${parentId}::combo::q${qi + 1}::a${ai + 1}`;
+}
+
+/**
+ * Synchronises combo-child records with a parent combo card.
+ * Expands the Cartesian product Q × A into one child per pair,
+ * each typed as "combo-child" for study.
+ */
+function syncComboChildren(plugin: LearnKitPlugin, parent: CardRecord, now: number, schedulingSnapshot?: StateMap | null) {
+  const parentId = String(parent?.id ?? "");
+  if (!parentId) return;
+
+  const ext = parent?.extensionData ?? {} as Record<string, unknown>;
+  let qVariants: string[] = Array.isArray(ext.qVariants) ? (ext.qVariants as string[]) : [];
+  let aVariants: string[] = Array.isArray(ext.aVariants) ? (ext.aVariants as string[]) : [];
+  const comboMode: string = (typeof ext.comboMode === "string" && ext.comboMode) || (typeof parent?.comboMode === "string" && parent.comboMode) || "product";
+
+  // Fallback: use raw Q/A fields split on :: / ::: when extensionData has no variants
+  if (qVariants.length <= 1 && aVariants.length <= 1) {
+    const qRaw = String(parent?.q ?? "").trim();
+    const aRaw = String(parent?.a ?? "").trim();
+    if (comboMode === "zip") {
+      qVariants = splitZipVariants(qRaw);
+      aVariants = splitZipVariants(aRaw);
+    } else {
+      qVariants = splitComboVariants(qRaw);
+      aVariants = splitComboVariants(aRaw);
+    }
+  }
+
+  if (qVariants.length < 1 || aVariants.length < 1) return;
+
+  const keepChildIds = new Set<string>();
+  const existingChildren = collectExistingChildren(plugin, parentId, "combo-child");
+
+  const titleBase = String(parent?.title ?? "").trim();
+
+  if (comboMode === "zip") {
+    // Sequential (zip) mode: pair variants by position. N cards total.
+    const count = Math.min(qVariants.length, aVariants.length);
+    for (let i = 0; i < count; i++) {
+      // Reuses stableComboChildId with qi === ai — IDs look like ::combo::q1::a1, ::combo::q2::a2 etc.
+      const childId = stableComboChildId(parentId, i, i);
+      keepChildIds.add(childId);
+
+      const prev = plugin.store.data.cards?.[childId];
+      const pairLabel = `Pair ${toNumberWord(i + 1)}`;
+      const childTitle = titleBase ? `${titleBase} – ${pairLabel}` : null;
+      const rec: CardRecord = {
+        id: childId,
+        type: "combo-child",
+        title: childTitle,
+        parentId,
+        q: qVariants[i] ?? null,
+        a: aVariants[i] ?? null,
+        info: parent?.info ?? null,
+        groups: parent?.groups ?? null,
+        sourceNotePath: String(parent?.sourceNotePath || ""),
+        sourceStartLine: Number(parent?.sourceStartLine ?? 0) || 0,
+        createdAt: resolveChildCreatedAt(prev, parent, now),
+        updatedAt: now,
+        lastSeenAt: now,
+      };
+
+      upsertChildRecord(plugin, childId, rec, now, schedulingSnapshot);
+    }
+  } else {
+    // Product mode (default): full Cartesian product Q × A.
+    for (let qi = 0; qi < qVariants.length; qi++) {
+      for (let ai = 0; ai < aVariants.length; ai++) {
+        const childId = stableComboChildId(parentId, qi, ai);
+        keepChildIds.add(childId);
+
+        const prev = plugin.store.data.cards?.[childId];
+        const pairLabel = `Question ${toNumberWord(qi + 1)}, Answer ${toNumberWord(ai + 1)}`;
+        const childTitle = titleBase ? `${titleBase} – ${pairLabel}` : null;
+        const rec: CardRecord = {
+          id: childId,
+          type: "combo-child",
+          title: childTitle,
+          parentId,
+          q: qVariants[qi] ?? null,
+          a: aVariants[ai] ?? null,
+          info: parent?.info ?? null,
+          groups: parent?.groups ?? null,
+          sourceNotePath: String(parent?.sourceNotePath || ""),
+          sourceStartLine: Number(parent?.sourceStartLine ?? 0) || 0,
+          createdAt: resolveChildCreatedAt(prev, parent, now),
+          updatedAt: now,
+          lastSeenAt: now,
+        };
+
+        upsertChildRecord(plugin, childId, rec, now, schedulingSnapshot);
+      }
+    }
+  }
+
+  pruneStaleChildren(plugin, existingChildren, keepChildIds);
+}
+
 /** Collects all normalised group keys (including prefixes) across cards. */
 function collectGroupKeys(cards: Record<string, CardRecord> | null | undefined): Set<string> {
   const out = new Set<string>();
@@ -877,8 +1127,9 @@ function countRemovedGroups(before: Set<string>, after: Set<string>): number {
 }
 
 /**
- * Deletes orphaned IO images from the vault.
- * An image is orphaned if it matches `sprout-io-*` but no IO card references it.
+ * Deletes orphaned IO / HQ images from the vault.
+ * Matches both the legacy `sprout-io-*` pattern and the new
+ * `{page} - LK-(IO|HQ)-NN.*` convention.
  */
 async function deleteOrphanedIoImages(plugin: LearnKitPlugin): Promise<number> {
   if (!plugin.settings?.storage?.deleteOrphanedImages) return 0;
@@ -886,51 +1137,76 @@ async function deleteOrphanedIoImages(plugin: LearnKitPlugin): Promise<number> {
   const vault = plugin.app.vault;
   const allFiles = vault.getFiles();
 
-  const referencedIoIds = new Set<string>();
-  
-  // Collect IO card IDs and unique file paths containing IO cards
+  // ── Collect all known image references ────────────────────────────────
+  const referencedImagePaths = new Set<string>();
   const ioCardIds = new Set<string>();
   const ioFilePaths = new Set<string>();
-  
+
   for (const id of Object.keys(plugin.store.data.cards || {})) {
     const card = plugin.store.data.cards[id];
-    if (card && String(card.type) === "io") {
+    if (!card) continue;
+    const cardType = String(card.type);
+    if (cardType === "io" || cardType === "hq") {
       ioCardIds.add(String(id));
-      if (card.sourceNotePath) {
-        ioFilePaths.add(card.sourceNotePath);
-      }
+      if (card.sourceNotePath) ioFilePaths.add(card.sourceNotePath);
+      if (card.imageRef) referencedImagePaths.add(card.imageRef);
     }
   }
 
-  // Only scan markdown files that contain IO cards
-  const re = /sprout-io-(\d{9})/g;
-  
+  // Also collect from the dedicated IO / HQ definition stores
+  for (const id of Object.keys(plugin.store.data.io || {})) {
+    const def = plugin.store.data.io?.[id];
+    if (def?.imageRef) referencedImagePaths.add(def.imageRef);
+  }
+  for (const id of Object.keys(plugin.store.data.hq || {})) {
+    const def = plugin.store.data.hq?.[id];
+    if (def?.imageRef) referencedImagePaths.add(def.imageRef);
+  }
+
+  // ── Legacy: scan markdown for sprout-io-(\d{9}) references ───────────
+  const oldRe = /sprout-io-(\d{9})/g;
+  const referencedIoIds = new Set<string>();
+
+  // ── New-style: scan markdown for LearnKit image embeds ────────────────
+  const newImgRe = /!\[\[([^\]]*(?:LK-IO|LK-HQ)[^\]]*)\]\]/gi;
+
   for (const filePath of ioFilePaths) {
     const md = vault.getAbstractFileByPath(filePath);
     if (!(md instanceof TFile)) continue;
-    
+
     try {
       const text = await vault.read(md);
       let match: RegExpExecArray | null;
-      while ((match = re.exec(text))) {
+      while ((match = oldRe.exec(text))) {
         if (match[1]) referencedIoIds.add(match[1]);
+      }
+      oldRe.lastIndex = 0;
+      while ((match = newImgRe.exec(text))) {
+        if (match[1]) referencedImagePaths.add(match[1].trim());
       }
     } catch {
       // ignore
     }
-    re.lastIndex = 0;
   }
+
+  // ── Patterns for file names ───────────────────────────────────────────
+  const OLD_IO_RE = /sprout-io-(\d{9})/;
+  const NEW_LK_RE = / - LK-(IO|HQ)-\d{2}\./;
 
   let deleted = 0;
 
   for (const file of allFiles) {
     if (!(file instanceof TFile)) continue;
-    const match = /sprout-io-(\d{9})/.exec(file.name);
-    if (!match) continue;
 
-    const ioId = match[1];
-    if (referencedIoIds.has(ioId)) continue;
-    if (ioCardIds.has(ioId)) continue;
+    const oldMatch = OLD_IO_RE.exec(file.name);
+    if (oldMatch) {
+      const ioId = oldMatch[1];
+      if (referencedIoIds.has(ioId) || ioCardIds.has(ioId)) continue;
+    } else if (NEW_LK_RE.test(file.name)) {
+      if (referencedImagePaths.has(file.path)) continue;
+    } else {
+      continue;
+    }
 
     try {
       await plugin.app.fileManager.trashFile(file);
@@ -1025,6 +1301,19 @@ function syncIoChildren(plugin: LearnKitPlugin, parent: CardRecord, now: number,
         } else {
           rectId = `r-${Math.random().toString(16).slice(2)}`;
         }
+        const shape = rect.shape === "circle" ? "circle" : rect.shape === "polygon" ? "polygon" : "rect";
+        const points = shape === "polygon" && Array.isArray(rect.points)
+          ? rect.points
+              .map((p) => {
+                if (!p || typeof p !== "object") return null;
+                const point = p as Record<string, unknown>;
+                const x = Number(point.x ?? 0);
+                const y = Number(point.y ?? 0);
+                if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+                return { x, y };
+              })
+              .filter((p): p is { x: number; y: number } => !!p)
+          : [];
         rects.push({
           rectId,
           x: Number(rect.x ?? 0),
@@ -1032,7 +1321,8 @@ function syncIoChildren(plugin: LearnKitPlugin, parent: CardRecord, now: number,
           w: Number(rect.w ?? rect.width ?? 0),
           h: Number(rect.h ?? rect.height ?? 0),
           groupKey: normaliseGroupKey(rect.groupKey as string | null),
-          shape: (rect.shape === "circle" ? "circle" : "rect"),
+          shape,
+          points: points.length >= 3 ? points : undefined,
         });
       }
       if (rects.length > 0) {
@@ -1340,10 +1630,10 @@ function hqFieldsFromParsed(
   return { imageRef, hqRegions, interactionMode };
 }
 
-/** Regex to extract a Sprout IO image ID from a filename. */
+/** Regex to extract a Sprout IO card ID from a legacy `sprout-io-NNNNNNNNN` filename. */
 const IO_IMAGE_ID_RE = /sprout-io-(\d{9})/i;
 
-/** Attempts to infer the card ID from an IO card's image reference. */
+/** Attempts to infer the card ID from an IO card's image reference (legacy naming only). */
 function inferIoIdFromCard(c: ParsedCard): string | null {
   if (!c || c.type !== "io") return null;
   const raw = String(c?.ioSrc ?? "");
@@ -1403,7 +1693,7 @@ async function pruneTtsCacheForCards(plugin: LearnKitPlugin, cardIds: readonly s
 export async function syncOneFile(
   plugin: LearnKitPlugin,
   file: TFile,
-  options?: { pruneGlobalOrphans?: boolean },
+  options?: { pruneGlobalOrphans?: boolean; sourceTextOverride?: string },
 ) {
   return withFileSyncLock(file.path, async () => {
     const vault = plugin.app.vault;
@@ -1418,7 +1708,9 @@ export async function syncOneFile(
     purgeDeprecatedTypes(plugin);
     quarantineIoCardsWithMissingImages(plugin);
 
-    const originalText = await vault.cachedRead(file);
+    const originalText = typeof options?.sourceTextOverride === "string"
+      ? options.sourceTextOverride
+      : await vault.cachedRead(file);
     const lines = originalText.split(/\r?\n/);
     const pruneGlobalOrphans = options?.pruneGlobalOrphans ?? true;
 
@@ -1433,7 +1725,7 @@ export async function syncOneFile(
       const rec = plugin.store.data.cards[id];
       if (!rec) continue;
       if (rec.sourceNotePath !== file.path) continue;
-      if (String(rec.type) === "io-child" || String(rec.type) === "hq-child" || String(rec.type) === "cloze-child" || String(rec.type) === "reversed-child") continue;
+      if (String(rec.type) === "io-child" || String(rec.type) === "hq-child" || String(rec.type) === "cloze-child" || String(rec.type) === "reversed-child" || String(rec.type) === "combo-child") continue;
       rec.lastSeenAt = 0;
     }
     for (const id of Object.keys(plugin.store.data.quarantine || {})) {
@@ -1509,6 +1801,7 @@ export async function syncOneFile(
       } else {
         queueCanonicalGroupFieldEdit(lines, edits, c);
         queueStripHiddenFields(lines, edits, c);
+        queueComboTypeMigration(lines, edits, c);
       }
     }
 
@@ -1558,6 +1851,11 @@ export async function syncOneFile(
     let quarantinedCount = 0;
     const quarantinedIds: string[] = [];
     const updatedCardIds: string[] = [];
+    const mutationEvents: { added: SyncMutationEvent[]; updated: SyncMutationEvent[]; deleted: SyncMutationEvent[] } = {
+      added: [],
+      updated: [],
+      deleted: [],
+    };
 
     for (const c of cards as Array<ParsedCard & { assignedId?: string }>) {
       const id = String(c.id || c.assignedId || "");
@@ -1592,8 +1890,8 @@ export async function syncOneFile(
 
         title: c.title ?? null,
 
-        q: (c.type === "basic" || c.type === "reversed" || c.type === "oq") ? (c.q ?? null) : null,
-        a: (c.type === "basic" || c.type === "reversed") ? (c.a ?? null) : c.type === "mcq" ? (c.a ?? null) : null,
+        q: (c.type === "basic" || c.type === "reversed" || c.type === "oq" || c.type === "combo") ? (c.q ?? null) : null,
+        a: (c.type === "basic" || c.type === "reversed" || c.type === "combo") ? (c.a ?? null) : c.type === "mcq" ? (c.a ?? null) : null,
 
         stem: c.type === "mcq" ? (c.stem ?? null) : null,
         ...(c.type === "mcq"
@@ -1630,6 +1928,13 @@ export async function syncOneFile(
 
         oqSteps: c.type === "oq" ? (c.oqSteps ?? []) : undefined,
 
+        extensionData: (c.type === "combo" || c.type === "basic") && (c.qVariants?.length > 1 || c.aVariants?.length > 1)
+          ? { qVariants: c.qVariants ?? [], aVariants: c.aVariants ?? [], comboMode: c.comboMode ?? "product" }
+          : undefined,
+        comboMode: (c.type === "combo" || c.type === "basic") && (c.qVariants?.length > 1 || c.aVariants?.length > 1)
+          ? (c.comboMode ?? "product")
+          : undefined,
+
         info: c.info ?? null,
         groups: c.groups ?? null,
 
@@ -1641,9 +1946,28 @@ export async function syncOneFile(
         lastSeenAt: now,
       };
 
-      if (!prev) newCount += 1;
-      else if (cardSignature(prev) !== cardSignature(record)) updatedCount += 1;
-      else sameCount += 1;
+      if (!prev) {
+        newCount += 1;
+        const event: SyncMutationEvent = {
+          id,
+          type: String(record.type),
+          notePath: String(record.sourceNotePath || ""),
+        };
+        mutationEvents.added.push(event);
+        logSyncMutation("syncOneFile", "added", event);
+      } else if (cardSignature(prev) !== cardSignature(record)) {
+        updatedCount += 1;
+        updatedCardIds.push(id);
+        const event: SyncMutationEvent = {
+          id,
+          type: String(record.type),
+          notePath: String(record.sourceNotePath || ""),
+        };
+        mutationEvents.updated.push(event);
+        logSyncMutation("syncOneFile", "updated", event);
+      } else {
+        sameCount += 1;
+      }
 
       plugin.store.upsertCard(record);
 
@@ -1664,6 +1988,19 @@ export async function syncOneFile(
 
       if (c.type === "cloze") syncClozeChildren(plugin, record, now, schedulingSnapshot);
       if (c.type === "reversed") syncReversedChildren(plugin, record, now, schedulingSnapshot);
+      const comboLikeInSource =
+        c.type === "combo" ||
+        (c.type === "basic" && (
+          (Array.isArray(c.qVariants) && c.qVariants.length > 1) ||
+          (Array.isArray(c.aVariants) && c.aVariants.length > 1) ||
+          splitComboVariants(String(c.q ?? "")).length > 1 ||
+          splitComboVariants(String(c.a ?? "")).length > 1 ||
+          splitZipVariants(String(c.q ?? "")).length > 1 ||
+          splitZipVariants(String(c.a ?? "")).length > 1 ||
+          splitZipVariants(String(c.q ?? "")).length > 1 ||
+          splitZipVariants(String(c.a ?? "")).length > 1
+        ));
+      if (comboLikeInSource) syncComboChildren(plugin, record, now, schedulingSnapshot);
 
       // IO: verify image exists, else quarantine; sync children if image present
       if (c.type === "io") {
@@ -1727,12 +2064,13 @@ export async function syncOneFile(
     const removedHqParentIds: string[] = [];
     const removedClozeParents: string[] = [];
     const removedReversedParents: string[] = [];
+    const removedComboParents: string[] = [];
 
     for (const id of Object.keys(plugin.store.data.cards || {})) {
       const rec = plugin.store.data.cards[id];
       if (!rec) continue;
       if (rec.sourceNotePath !== file.path) continue;
-      if (String(rec.type) === "io-child" || String(rec.type) === "hq-child" || String(rec.type) === "cloze-child" || String(rec.type) === "reversed-child") continue;
+      if (String(rec.type) === "io-child" || String(rec.type) === "hq-child" || String(rec.type) === "cloze-child" || String(rec.type) === "reversed-child" || String(rec.type) === "combo-child") continue;
 
       if (rec.lastSeenAt === 0) {
         const cardType = String(rec.type);
@@ -1740,11 +2078,29 @@ export async function syncOneFile(
         if (cardType === "hq") removedHqParentIds.push(String(id));
         if (cardType === "cloze") removedClozeParents.push(String(id));
         if (cardType === "reversed") removedReversedParents.push(String(id));
+        if (cardType === "combo") removedComboParents.push(String(id));
+        if (cardType === "basic") {
+          const ext = rec.extensionData;
+          if (ext && typeof ext === "object" && !Array.isArray(ext)) {
+            const ed = ext;
+            if ((Array.isArray(ed.qVariants) && ed.qVariants.length > 1) || (Array.isArray(ed.aVariants) && ed.aVariants.length > 1)) {
+              removedComboParents.push(String(id));
+            }
+          }
+        }
 
         delete plugin.store.data.cards[id];
         if (plugin.store.data.states) delete (plugin.store.data.states)[id];
         removed += 1;
         if (countsAsStudyCardDeletion(cardType)) deletedDisplayCount += 1;
+        const event: SyncMutationEvent = {
+          id: String(id),
+          type: cardType,
+          notePath: String(rec.sourceNotePath || ""),
+          reason: "missing-in-source-note",
+        };
+        mutationEvents.deleted.push(event);
+        logSyncMutation("syncOneFile", "deleted", event);
       }
     }
 
@@ -1775,6 +2131,11 @@ export async function syncOneFile(
       removed += childRemoved;
       deletedDisplayCount += childRemoved;
     }
+    for (const parentId of removedComboParents) {
+      const childRemoved = deleteComboChildren(plugin, parentId);
+      removed += childRemoved;
+      deletedDisplayCount += childRemoved;
+    }
 
     for (const id of Object.keys(plugin.store.data.quarantine || {})) {
       const q = plugin.store.data.quarantine[id];
@@ -1782,6 +2143,14 @@ export async function syncOneFile(
         delete plugin.store.data.quarantine[id];
         if (plugin.store.data.states) delete (plugin.store.data.states)[id];
         removed += 1;
+        const event: SyncMutationEvent = {
+          id: String(id),
+          type: "quarantine",
+          notePath: String(q.notePath || ""),
+          reason: "quarantine-entry-stale",
+        };
+        mutationEvents.deleted.push(event);
+        logSyncMutation("syncOneFile", "deleted", event);
       }
     }
 
@@ -1790,8 +2159,9 @@ export async function syncOneFile(
       const orphanHqRemoved = deleteOrphanHqChildren(plugin);
       const orphanClozeRemoved = deleteOrphanClozeChildren(plugin);
       const orphanReversedRemoved = deleteOrphanReversedChildren(plugin);
-      removed += orphanIoRemoved + orphanHqRemoved + orphanClozeRemoved + orphanReversedRemoved;
-      deletedDisplayCount += orphanIoRemoved + orphanHqRemoved + orphanClozeRemoved + orphanReversedRemoved;
+      const orphanComboRemoved = deleteOrphanComboChildren(plugin);
+      removed += orphanIoRemoved + orphanHqRemoved + orphanClozeRemoved + orphanReversedRemoved + orphanComboRemoved;
+      deletedDisplayCount += orphanIoRemoved + orphanHqRemoved + orphanClozeRemoved + orphanReversedRemoved + orphanComboRemoved;
       const sanitizedStates = sanitizeOrphanStates(plugin);
       if (sanitizedStates > 0) {
         log.info(`syncOneFile: pruned ${sanitizedStates} orphaned scheduling state(s)`);
@@ -1808,6 +2178,8 @@ export async function syncOneFile(
 
     const groupsAfter = collectGroupKeys(plugin.store.data.cards || {});
     const tagsDeleted = countRemovedGroups(groupsBefore, groupsAfter);
+
+    logSyncMutationSummary("syncOneFile", mutationEvents);
 
     await plugin.store.persist();
 
@@ -1855,7 +2227,7 @@ export async function syncQuestionBank(plugin: LearnKitPlugin) {
     for (const id of Object.keys(plugin.store.data.cards || {})) {
       const c = plugin.store.data.cards[id];
       if (!c) continue;
-      if (String(c.type) === "io-child" || String(c.type) === "hq-child" || String(c.type) === "cloze-child" || String(c.type) === "reversed-child") continue;
+      if (String(c.type) === "io-child" || String(c.type) === "hq-child" || String(c.type) === "cloze-child" || String(c.type) === "reversed-child" || String(c.type) === "combo-child") continue;
       c.lastSeenAt = 0;
     }
     for (const id of Object.keys(plugin.store.data.quarantine || {})) {
@@ -1872,6 +2244,11 @@ export async function syncQuestionBank(plugin: LearnKitPlugin) {
     let quarantinedCount = 0;
     const quarantinedIds: string[] = [];
     const updatedCardIds: string[] = [];
+    const mutationEvents: { added: SyncMutationEvent[]; updated: SyncMutationEvent[]; deleted: SyncMutationEvent[] } = {
+      added: [],
+      updated: [],
+      deleted: [],
+    };
 
     let removed = 0;
     let deletedDisplayCount = 0;
@@ -1975,6 +2352,7 @@ export async function syncQuestionBank(plugin: LearnKitPlugin) {
         } else {
           queueCanonicalGroupFieldEdit(lines, edits, c);
           queueStripHiddenFields(lines, edits, c);
+          queueComboTypeMigration(lines, edits, c);
         }
       }
 
@@ -2049,8 +2427,8 @@ export async function syncQuestionBank(plugin: LearnKitPlugin) {
 
         title: c.title ?? null,
 
-        q: (c.type === "basic" || c.type === "reversed" || c.type === "oq") ? (c.q ?? null) : null,
-        a: (c.type === "basic" || c.type === "reversed") ? (c.a ?? null) : c.type === "mcq" ? (c.a ?? null) : null,
+        q: (c.type === "basic" || c.type === "reversed" || c.type === "oq" || c.type === "combo") ? (c.q ?? null) : null,
+        a: (c.type === "basic" || c.type === "reversed" || c.type === "combo") ? (c.a ?? null) : c.type === "mcq" ? (c.a ?? null) : null,
 
         stem: c.type === "mcq" ? (c.stem ?? null) : null,
         ...(c.type === "mcq"
@@ -2086,6 +2464,13 @@ export async function syncQuestionBank(plugin: LearnKitPlugin) {
 
         oqSteps: c.type === "oq" ? (c.oqSteps ?? []) : undefined,
 
+        extensionData: (c.type === "combo" || c.type === "basic") && (c.qVariants?.length > 1 || c.aVariants?.length > 1)
+          ? { qVariants: c.qVariants ?? [], aVariants: c.aVariants ?? [], comboMode: c.comboMode ?? "product" }
+          : undefined,
+        comboMode: (c.type === "combo" || c.type === "basic") && (c.qVariants?.length > 1 || c.aVariants?.length > 1)
+          ? (c.comboMode ?? "product")
+          : undefined,
+
         info: c.info ?? null,
         groups: c.groups ?? null,
 
@@ -2097,9 +2482,28 @@ export async function syncQuestionBank(plugin: LearnKitPlugin) {
         lastSeenAt: now,
       };
 
-      if (!prev) newCount += 1;
-      else if (cardSignature(prev) !== cardSignature(record)) { updatedCount += 1; updatedCardIds.push(id); }
-      else sameCount += 1;
+      if (!prev) {
+        newCount += 1;
+        const event: SyncMutationEvent = {
+          id,
+          type: String(record.type),
+          notePath: String(record.sourceNotePath || ""),
+        };
+        mutationEvents.added.push(event);
+        logSyncMutation("syncQuestionBank", "added", event);
+      } else if (cardSignature(prev) !== cardSignature(record)) {
+        updatedCount += 1;
+        updatedCardIds.push(id);
+        const event: SyncMutationEvent = {
+          id,
+          type: String(record.type),
+          notePath: String(record.sourceNotePath || ""),
+        };
+        mutationEvents.updated.push(event);
+        logSyncMutation("syncQuestionBank", "updated", event);
+      } else {
+        sameCount += 1;
+      }
 
       plugin.store.upsertCard(record);
 
@@ -2120,6 +2524,15 @@ export async function syncQuestionBank(plugin: LearnKitPlugin) {
 
       if (c.type === "cloze") syncClozeChildren(plugin, record, now, schedulingSnapshot);
       if (c.type === "reversed") syncReversedChildren(plugin, record, now, schedulingSnapshot);
+      const comboLikeInSource =
+        c.type === "combo" ||
+        (c.type === "basic" && (
+          (Array.isArray(c.qVariants) && c.qVariants.length > 1) ||
+          (Array.isArray(c.aVariants) && c.aVariants.length > 1) ||
+          splitComboVariants(String(c.q ?? "")).length > 1 ||
+          splitComboVariants(String(c.a ?? "")).length > 1
+        ));
+      if (comboLikeInSource) syncComboChildren(plugin, record, now, schedulingSnapshot);
 
       if (c.type === "io") {
         let ioQuarantined = false;
@@ -2179,12 +2592,13 @@ export async function syncQuestionBank(plugin: LearnKitPlugin) {
     const removedHqParentIds: string[] = [];
     const removedClozeParents: string[] = [];
     const removedReversedParents: string[] = [];
+    const removedComboParents: string[] = [];
 
     for (const id of Object.keys(plugin.store.data.cards || {})) {
       const card = plugin.store.data.cards[id];
       if (!card) continue;
 
-      if (String(card.type) === "io-child" || String(card.type) === "hq-child" || String(card.type) === "cloze-child" || String(card.type) === "reversed-child") continue;
+      if (String(card.type) === "io-child" || String(card.type) === "hq-child" || String(card.type) === "cloze-child" || String(card.type) === "reversed-child" || String(card.type) === "combo-child") continue;
 
       if (card.lastSeenAt !== now) {
         const cardType = String(card.type);
@@ -2192,11 +2606,29 @@ export async function syncQuestionBank(plugin: LearnKitPlugin) {
         if (cardType === "hq") removedHqParentIds.push(String(id));
         if (cardType === "cloze") removedClozeParents.push(String(id));
         if (cardType === "reversed") removedReversedParents.push(String(id));
+        if (cardType === "combo") removedComboParents.push(String(id));
+        if (cardType === "basic") {
+          const ext = card.extensionData;
+          if (ext && typeof ext === "object" && !Array.isArray(ext)) {
+            const ed = ext;
+            if ((Array.isArray(ed.qVariants) && ed.qVariants.length > 1) || (Array.isArray(ed.aVariants) && ed.aVariants.length > 1)) {
+              removedComboParents.push(String(id));
+            }
+          }
+        }
 
         delete plugin.store.data.cards[id];
         if (plugin.store.data.states) delete (plugin.store.data.states)[id];
         removed += 1;
         if (countsAsStudyCardDeletion(cardType)) deletedDisplayCount += 1;
+        const event: SyncMutationEvent = {
+          id: String(id),
+          type: cardType,
+          notePath: String(card.sourceNotePath || ""),
+          reason: "missing-in-vault-scan",
+        };
+        mutationEvents.deleted.push(event);
+        logSyncMutation("syncQuestionBank", "deleted", event);
       }
     }
 
@@ -2227,6 +2659,11 @@ export async function syncQuestionBank(plugin: LearnKitPlugin) {
       removed += childRemoved;
       deletedDisplayCount += childRemoved;
     }
+    for (const parentId of removedComboParents) {
+      const childRemoved = deleteComboChildren(plugin, parentId);
+      removed += childRemoved;
+      deletedDisplayCount += childRemoved;
+    }
 
     for (const id of Object.keys(plugin.store.data.quarantine || {})) {
       const q = plugin.store.data.quarantine[id];
@@ -2234,6 +2671,14 @@ export async function syncQuestionBank(plugin: LearnKitPlugin) {
         delete plugin.store.data.quarantine[id];
         if (plugin.store.data.states) delete (plugin.store.data.states)[id];
         removed += 1;
+        const event: SyncMutationEvent = {
+          id: String(id),
+          type: "quarantine",
+          notePath: String(q.notePath || ""),
+          reason: "quarantine-entry-stale",
+        };
+        mutationEvents.deleted.push(event);
+        logSyncMutation("syncQuestionBank", "deleted", event);
       }
     }
 
@@ -2241,8 +2686,9 @@ export async function syncQuestionBank(plugin: LearnKitPlugin) {
     const orphanHqRemoved = deleteOrphanHqChildren(plugin);
     const orphanClozeRemoved = deleteOrphanClozeChildren(plugin);
     const orphanReversedRemoved = deleteOrphanReversedChildren(plugin);
-    removed += orphanIoRemoved + orphanHqRemoved + orphanClozeRemoved + orphanReversedRemoved;
-    deletedDisplayCount += orphanIoRemoved + orphanHqRemoved + orphanClozeRemoved + orphanReversedRemoved;
+    const orphanComboRemoved = deleteOrphanComboChildren(plugin);
+    removed += orphanIoRemoved + orphanHqRemoved + orphanClozeRemoved + orphanReversedRemoved + orphanComboRemoved;
+    deletedDisplayCount += orphanIoRemoved + orphanHqRemoved + orphanClozeRemoved + orphanReversedRemoved + orphanComboRemoved;
     const sanitizedStates = sanitizeOrphanStates(plugin);
     if (sanitizedStates > 0) {
       log.info(`syncQuestionBank: pruned ${sanitizedStates} orphaned scheduling state(s)`);
@@ -2253,6 +2699,8 @@ export async function syncQuestionBank(plugin: LearnKitPlugin) {
 
     const deletedImages = await deleteOrphanedIoImages(plugin);
     if (deletedImages > 0) log.info(`Deleted ${deletedImages} orphaned IO image(s)`);
+
+    logSyncMutationSummary("syncQuestionBank", mutationEvents);
 
     // Prune TTS cache for cards that were removed or edited during full sync
     const allCardIdsAfter = new Set(Object.keys(plugin.store.data.cards || {}));

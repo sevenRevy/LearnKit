@@ -137,6 +137,13 @@ type Args = {
   hideSessionTopbar?: boolean;
 
   rerender: () => void;
+
+  /**
+   * When provided, renderSessionMode reuses this element as the card wrapper
+   * instead of creating a new one. Used for lightweight card-only refreshes
+   * (reveal / next-card) that preserve the title strip & shell layout.
+   */
+  targetEl?: HTMLElement;
 };
 
 /** Shared rendering context passed to per-card-type helpers. */
@@ -1100,17 +1107,27 @@ export function renderSessionMode(args: Args) {
   const graded = args.session?.graded?.[id] || null;
   const isFlashcardStudyMode = args.session?.mode === "scheduled" || args.session?.mode === "practice";
 
-  // ===== Render Study Session header (persists across all card renders) =====
-  renderStudySessionHeader(args.container, args.interfaceLanguage, applyAOS, {
-    titleToken: "ui.reviewer.session.header.title",
-    titleFallback: "Flashcards",
-  });
+  // ===== Target element: reuse existing card wrapper for lightweight refreshes =====
+  const reusableTarget = args.targetEl;
+  const wrap = reusableTarget ?? document.createElement("div");
 
-  // ===== Root card (Basecoat) =====
-  const wrap = document.createElement("div");
-  wrap.className = "card w-full";
-  // Optional: keep a plugin hook class for any small overrides you still want.
-  wrap.classList.add("learnkit-session-card", "lk-session-card", "m-0");
+  if (reusableTarget) {
+    // Lightweight refresh: clear the existing card element and re-render into it.
+    // The title strip and study session header are preserved by the caller.
+    reusableTarget.innerHTML = "";
+    reusableTarget.className = "card w-full";
+    reusableTarget.classList.add("learnkit-session-card", "lk-session-card", "m-0");
+  } else {
+    // Full render: render the study session header and append the card to container.
+    renderStudySessionHeader(args.container, args.interfaceLanguage, applyAOS, {
+      titleToken: "ui.reviewer.session.header.title",
+      titleFallback: "Flashcards",
+    });
+
+    wrap.className = "card w-full";
+    wrap.classList.add("learnkit-session-card", "lk-session-card", "m-0");
+  }
+
   wrap.classList.toggle("learnkit-session-answer-revealed", !!args.showAnswer || !!graded);
   const resetAosState = () => {
     wrap.classList.remove("aos-init", "aos-animate", "learnkit-aos-fallback", "learnkit-aos-fallback");
@@ -1235,7 +1252,7 @@ export function renderSessionMode(args: Args) {
       footerCenter.appendChild(backBtn);
     }
 
-    args.container.appendChild(wrap);
+    if (!reusableTarget) args.container.appendChild(wrap);
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
         try {
@@ -1348,18 +1365,20 @@ export function renderSessionMode(args: Args) {
   const renderMdBlock = (cls: string, md: string) => {
     const block = document.createElement("div");
     block.className = `bc ${cls} whitespace-pre-wrap break-words learnkit-md-block`;
-    void args.renderMarkdownInto(block, md ?? "", sourcePath).then(() => setupLinkHandlers(block, sourcePath));
+    // Escape HTML so Obsidian's MarkdownRenderer doesn't strip literal <angle> brackets
+    const safe = String(md ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    void args.renderMarkdownInto(block, safe, sourcePath).then(() => setupLinkHandlers(block, sourcePath));
     return block;
   };
 
-  if (card.type === "basic" || card.type === "reversed" || card.type === "reversed-child") {
+  if (card.type === "basic" || card.type === "reversed" || card.type === "reversed-child" || card.type === "combo-child") {
     // For reversed-child with direction "back", swap content (A→Q)
     const isBackDirection = card.type === "reversed-child" && (card as unknown as { reversedDirection?: string }).reversedDirection === "back";
     const isOldReversed = card.type === "reversed";
     const frontContent = (isBackDirection || isOldReversed) ? (card.a || "") : (card.q || "");
     const backContent = (isBackDirection || isOldReversed) ? (card.q || "") : (card.a || "");
-    const replayFront = card.type === "basic" ? args.ttsReplayFront : undefined;
-    const replayBack = card.type === "basic" ? args.ttsReplayBack : undefined;
+    const replayFront = (card.type === "basic" || card.type === "combo-child") ? args.ttsReplayFront : undefined;
+    const replayBack = (card.type === "basic" || card.type === "combo-child") ? args.ttsReplayBack : undefined;
 
     section.appendChild(labelRow("Question", replayFront));
     section.appendChild(renderMdBlock("learnkit-q", convertInlineDisplayMath(frontContent)));
@@ -1445,7 +1464,7 @@ export function renderSessionMode(args: Args) {
   const infoText = extractInfoField(card);
   const isBack = !!graded || !!args.showAnswer;
   const shouldShowInfo =
-    ((card.type === "basic" || card.type === "reversed" || card.type === "reversed-child") && isBack && !!infoText) || ((args.showInfo || graded) && !!infoText);
+    ((card.type === "basic" || card.type === "reversed" || card.type === "reversed-child" || card.type === "combo-child") && isBack && !!infoText) || ((args.showInfo || graded) && !!infoText);
   if (shouldShowInfo) {
     section.appendChild(labelRow("Extra information"));
     section.appendChild(renderMdBlock("learnkit-info", infoText));
@@ -1504,7 +1523,7 @@ export function renderSessionMode(args: Args) {
 
   const canGradeNow =
     !graded &&
-    (((card.type === "basic" || card.type === "reversed" || card.type === "reversed-child" || card.type === "cloze" || card.type === "cloze-child" || ioLike) && !!args.showAnswer) ||
+    (((card.type === "basic" || card.type === "reversed" || card.type === "reversed-child" || card.type === "combo-child" || card.type === "cloze" || card.type === "cloze-child" || ioLike) && !!args.showAnswer) ||
       (card.type === "mcq" && args.autoGradeMcq === false && !!args.showAnswer) ||
       (card.type === "oq" && args.autoGradeOq === false && !!args.showAnswer));
 
@@ -1515,7 +1534,7 @@ export function renderSessionMode(args: Args) {
 
   // Basic/Cloze/IO: reveal gate
   if (
-    (card.type === "basic" || card.type === "reversed" || card.type === "reversed-child" || card.type === "cloze" || card.type === "cloze-child" || (ioLike && !hotspotCard)) &&
+    (card.type === "basic" || card.type === "reversed" || card.type === "reversed-child" || card.type === "combo-child" || card.type === "cloze" || card.type === "cloze-child" || (ioLike && !hotspotCard)) &&
     !args.showAnswer &&
     !graded
   ) {
@@ -1703,8 +1722,7 @@ export function renderSessionMode(args: Args) {
       mainRow.appendChild(h("div", "text-muted-foreground text-sm", buildHotspotQuestionPrompt(card)));
       hasMainRowContent = true;
     } else if (ioLike && !args.showAnswer) {
-      mainRow.appendChild(h("div", "text-muted-foreground text-sm", "Press Enter to reveal the image."));
-      hasMainRowContent = true;
+      // Hint text removed — the Reveal button is self-explanatory.
     }
   } else {
     mainRow.appendChild(
@@ -1764,7 +1782,7 @@ export function renderSessionMode(args: Args) {
   }
   footer.appendChild(footerRight);
 
-  args.container.appendChild(wrap);
+  if (!reusableTarget) args.container.appendChild(wrap);
   // Always refresh AOS to ensure animations work across the page
   requestAnimationFrame(() => {
     requestAnimationFrame(() => {

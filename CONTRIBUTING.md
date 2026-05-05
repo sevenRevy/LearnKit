@@ -1,6 +1,6 @@
 # Contributing to LearnKit
 
-Thanks for helping to improve LearnKit.
+Thanks for helping to improve LearnKit. 
 
 This document covers two common contribution paths:
 

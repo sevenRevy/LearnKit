@@ -81,6 +81,9 @@ export class SproutWidgetView extends ItemView {
 
   private _keysBound = false;
 
+  /** Guard against double-processing the same event from window-capture + container-bubble listeners. */
+  private _lastKeyEvent: KeyboardEvent | null = null;
+
   constructor(leaf: WorkspaceLeaf, plugin: LearnKitPlugin) {
     super(leaf);
     this.plugin = plugin;
@@ -339,6 +342,11 @@ export class SproutWidgetView extends ItemView {
     const attempts = this._pendingHotspotAttempts.get(String(cardId)) || null;
     if (!attempts || attempts.length === 0) return null;
     return attempts;
+  }
+
+  /** Public accessor so external consumers (e.g. reminder-engine) can pass attempts to Gatekeeper. */
+  public getPendingHotspotAttempts(): Map<string, HotspotAttemptState[]> {
+    return this._pendingHotspotAttempts;
   }
 
   private _peekPendingHotspotAttempt(cardId: string): HotspotAttemptState | null {
@@ -819,6 +827,11 @@ export class SproutWidgetView extends ItemView {
   /* ---------------------------------------------------------------- */
 
   private handleKey(ev: KeyboardEvent) {
+    // Prevent double-processing: the window capture listener and the container
+    // bubble listener both receive the same event object.
+    if (this._lastKeyEvent === ev) return;
+    this._lastKeyEvent = ev;
+
     const t = ev.target as HTMLElement | null;
     if (
       t &&
@@ -931,12 +944,24 @@ export class SproutWidgetView extends ItemView {
         return;
       }
       if (hotspotCard) {
-        if (graded) {
-          void this.nextCard();
+        if (!this.showAnswer) {
+          this.showAnswer = true;
+          this.render();
+          return;
         }
+        void this.nextCard();
         return;
       }
-      if (card.type === "basic" || card.type === "reversed" || card.type === "reversed-child" || isClozeLike(card) || ioLike) {
+      if (card.type === "io" || card.type === "io-child") {
+        if (!this.showAnswer) {
+          this.showAnswer = true;
+          this.render();
+          return;
+        }
+        void this.nextCard();
+        return;
+      }
+      if (card.type === "basic" || card.type === "reversed" || card.type === "reversed-child" || card.type === "combo-child" || isClozeLike(card)) {
         if (!this.showAnswer) {
           this.showAnswer = true;
           this.render();
@@ -996,7 +1021,7 @@ export class SproutWidgetView extends ItemView {
         return;
       }
 
-      if (card.type === "basic" || card.type === "reversed" || card.type === "reversed-child" || isClozeLike(card) || ioLike) {
+      if (card.type === "basic" || card.type === "reversed" || card.type === "reversed-child" || card.type === "combo-child" || isClozeLike(card) || ioLike) {
         if (!this.showAnswer) {
           this.showAnswer = true;
           this.render();
